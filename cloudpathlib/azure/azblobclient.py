@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 import mimetypes
 import os
@@ -5,6 +6,8 @@ from http import HTTPStatus
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple, Union
 from itertools import islice
+
+from azure.storage.blob._shared.response_handlers import process_storage_error
 
 try:
     from typing import cast
@@ -42,6 +45,16 @@ try:
 
 except ModuleNotFoundError:
     implementation_registry["azure"].dependencies_loaded = False
+
+
+@dataclass
+class AzurePathProperties:
+    """Properties of an Azure Blob often queried together"""
+
+    exists: bool
+    size: int | None  # TODO: is this needed?
+    is_directory: bool
+    last_modified: datetime | None
 
 
 @register_client_class("azure")
@@ -256,6 +269,78 @@ class AzureBlobClient(Client):
             properties["content_type"] = properties.content_settings.content_type
 
         return properties
+
+    def _get_container_metadata(self, cloud_path: AzureBlobPath) -> AzurePathProperties:
+        """Get metadata for an Azure Container. Can be called on a non-existent container."""
+
+        try:
+            container_client = self.service_client.get_container_client(cloud_path.container)
+            container_properties = container_client.get_container_properties()
+        except HttpResponseError as error:
+            try:
+                process_storage_error(error)
+            except ResourceNotFoundError:
+                return AzurePathProperties(
+                    exists=False, size=None, last_modified=None, is_directory=True
+                )
+
+        exists = True
+        last_modified = container_properties.last_modified
+        is_directory = True
+        size = 0  # TODO: can't get size of container. decide on sensible default
+
+        return AzurePathProperties(
+            exists=exists, size=size, last_modified=last_modified, is_directory=is_directory
+        )
+
+    def _get_blob_metadata(self, cloud_path: AzureBlobPath) -> AzurePathProperties:
+        """Get metadata for an Azure Blob. Can be called on a non-existent blob."""
+
+        try:
+            blob_metadata = cast(BlobProperties | FileProperties, self._get_metadata(cloud_path))
+        # thrown if not HNS and file does not exist _or_ is dir; check if is dir instead
+        except ResourceNotFoundError:
+            prefix = cloud_path.blob
+            if prefix and not prefix.endswith("/"):
+                prefix += "/"
+
+            container_client = self.service_client.get_container_client(cloud_path.container)
+
+            try:
+                next(container_client.list_blobs(name_starts_with=prefix))
+                # this is a directory but we don't know the size or last modified since not HNS
+                return AzurePathProperties(
+                    exists=True, size=None, last_modified=None, is_directory=True
+                )
+            except StopIteration:
+                # this is not a directory hence does not exist
+                return AzurePathProperties(
+                    exists=False, size=None, last_modified=None, is_directory=False
+                )
+
+        exists = True
+        last_modified = blob_metadata.last_modified
+        is_directory = blob_metadata.get(
+            "is_directory", False
+        ) or blob_metadata.get(  # type: ignore
+            "metadata", {}
+        ).get(
+            "hdi_isfolder", False
+        )  # type: ignore
+        size = blob_metadata.size
+
+        return AzurePathProperties(
+            exists=exists, size=size, last_modified=last_modified, is_directory=is_directory
+        )
+
+    def _get_path_meta(self, cloud_path: AzureBlobPath) -> AzurePathProperties:
+        """Get metadata for an Azure Blob. Can be called on a non-existent blob."""
+
+        # this is a root-level container
+        if not cloud_path.blob:
+            return self._get_container_metadata(cloud_path)
+
+        return self._get_blob_metadata(cloud_path)
 
     @staticmethod
     def _partial_filename(local_path) -> Path:
